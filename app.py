@@ -4,11 +4,12 @@ import requests
 import threading
 import uuid
 import time
+import tempfile
 from flask import Flask, request, jsonify
 import yt_dlp
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
+from googleapiclient.http import MediaFileUpload
 
 app = Flask(__name__)
 
@@ -27,27 +28,16 @@ def get_drive_service():
     )
     return build("drive", "v3", credentials=creds)
 
-class FileStreamWrapper:
-    def __init__(self, raw_stream):
-        self.raw_stream = raw_stream
-        self.position = 0
-
-    def read(self, size=-1):
-        chunk = self.raw_stream.read(size)
-        if chunk:
-            self.position += len(chunk)
-        return chunk
-
-    def tell(self):
-        return self.position
-
-def get_direct_video_url(youtube_url):
+def download_video(youtube_url, output_path, job_id):
     cookie_file_path = None
     ydl_opts = {
-        'format': 'best[ext=mp4]/best',
+        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best',
+        'merge_output_format': 'mp4',
+        'outtmpl': output_path,
         'quiet': True,
         'no_warnings': True,
-        'nocheckcertificate': True
+        'nocheckcertificate': True,
+        'progress_hooks': [lambda d: update_download_progress(d, job_id)],
     }
 
     if YOUTUBE_COOKIES:
@@ -58,36 +48,61 @@ def get_direct_video_url(youtube_url):
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(youtube_url, download=False)
-            return info['url'], info.get('title', 'video') + '.mp4'
+            info = ydl.extract_info(youtube_url, download=True)
+            title = info.get('title', 'video')
+            return title + '.mp4'
     finally:
         if cookie_file_path and os.path.exists(cookie_file_path):
             os.remove(cookie_file_path)
 
+def update_download_progress(d, job_id):
+    if d['status'] == 'downloading':
+        total = d.get('total_bytes') or d.get('total_bytes_estimate', 0)
+        downloaded = d.get('downloaded_bytes', 0)
+        if total > 0:
+            pct = int(downloaded / total * 50)  # 0-50% = הורדה
+            JOBS[job_id]['progress'] = pct
+            JOBS[job_id]['status'] = f'מוריד... {pct*2}%'
+    elif d['status'] == 'finished':
+        JOBS[job_id]['status'] = 'מעלה לדרייב...'
+        JOBS[job_id]['progress'] = 50
+
 def process_video_background(job_id, youtube_url):
+    tmp_dir = tempfile.mkdtemp()
+    tmp_file = os.path.join(tmp_dir, f"{job_id}.%(ext)s")
+    actual_file = None
+
     try:
         service = get_drive_service()
 
-        JOBS[job_id]['status'] = 'מחפש נתונים...'
-        direct_url, file_name = get_direct_video_url(youtube_url)
+        JOBS[job_id]['status'] = 'מוריד מיוטיוב...'
+        JOBS[job_id]['progress'] = 0
+
+        file_name = download_video(youtube_url, tmp_file, job_id)
+
+        # מצא את הקובץ שנוצר
+        for f in os.listdir(tmp_dir):
+            if f.startswith(job_id):
+                actual_file = os.path.join(tmp_dir, f)
+                file_name = f.replace(job_id + '.', '') 
+                break
+
+        if not actual_file or not os.path.exists(actual_file):
+            raise FileNotFoundError("הקובץ לא נמצא לאחר ההורדה")
+
         JOBS[job_id]['file_name'] = file_name
-
-        JOBS[job_id]['status'] = 'מתחבר לזרם...'
-        response = requests.get(direct_url, stream=True)
-        response.raise_for_status()
-
-        stream_wrapper = FileStreamWrapper(response.raw)
+        JOBS[job_id]['status'] = 'מעלה לדרייב...'
+        JOBS[job_id]['progress'] = 50
 
         file_metadata = {
             'name': file_name,
             'parents': [GOOGLE_DRIVE_FOLDER_ID] if GOOGLE_DRIVE_FOLDER_ID else []
         }
 
-        CHUNK_SIZE = 5 * 1024 * 1024
-        media = MediaIoBaseUpload(
-            stream_wrapper,
+        media = MediaFileUpload(
+            actual_file,
             mimetype='video/mp4',
-            chunksize=CHUNK_SIZE,
+            chunksize=5 * 1024 * 1024,
             resumable=True
         )
 
@@ -101,28 +116,38 @@ def process_video_background(job_id, youtube_url):
         retries = 0
         MAX_RETRIES = 5
 
-        JOBS[job_id]['status'] = 'מעלה...'
-
         while response_upload is None:
             try:
                 status, response_upload = request_upload.next_chunk()
                 if status:
-                    progress = int(status.progress() * 100)
-                    JOBS[job_id]['progress'] = progress
+                    upload_pct = int(status.progress() * 50) + 50  # 50-100% = העלאה
+                    JOBS[job_id]['progress'] = upload_pct
+                    JOBS[job_id]['status'] = f'מעלה לדרייב... {upload_pct}%'
                     retries = 0
             except Exception as chunk_error:
                 retries += 1
                 if retries > MAX_RETRIES:
-                    raise Exception(f"ההעלאה נכשלה לאחר {MAX_RETRIES} ניסיונות. שגיאה: {str(chunk_error)}")
+                    raise Exception(f"ההעלאה נכשלה לאחר {MAX_RETRIES} ניסיונות: {str(chunk_error)}")
                 time.sleep(2 ** retries)
 
-        JOBS[job_id]['status'] = 'הסתיים בהצלחה'
+        JOBS[job_id]['status'] = 'הסתיים בהצלחה ✅'
         JOBS[job_id]['drive_file_id'] = response_upload.get('id')
+        JOBS[job_id]['drive_link'] = f"https://drive.google.com/file/d/{response_upload.get('id')}/view"
         JOBS[job_id]['progress'] = 100
 
     except Exception as e:
-        JOBS[job_id]['status'] = 'שגיאה'
+        JOBS[job_id]['status'] = 'שגיאה ❌'
         JOBS[job_id]['error'] = str(e)
+
+    finally:
+        # נקה קבצים זמניים
+        if actual_file and os.path.exists(actual_file):
+            os.remove(actual_file)
+        if os.path.exists(tmp_dir):
+            try:
+                os.rmdir(tmp_dir)
+            except:
+                pass
 
 @app.route('/health', methods=['GET'])
 def health():
@@ -160,4 +185,5 @@ def get_status(job_id):
     return jsonify(job_info), 200
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port)
