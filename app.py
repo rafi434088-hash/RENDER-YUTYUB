@@ -50,12 +50,14 @@ def update_download_progress(d, job_id):
 def download_video(youtube_url, output_path, job_id):
     cookie_file_path = write_cookie_file()
 
+    # פורמטים שלא דורשים ffmpeg - progressive MP4/WebM בלבד
     ydl_opts = {
-        'format': 'best',
+        'format': 'best[ext=mp4]/best[ext=webm]/best',
         'outtmpl': output_path,
         'quiet': True,
         'no_warnings': True,
         'nocheckcertificate': True,
+        'noplaylist': True,
         'progress_hooks': [lambda d: update_download_progress(d, job_id)],
     }
 
@@ -65,7 +67,7 @@ def download_video(youtube_url, output_path, job_id):
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(youtube_url, download=True)
-            return info.get('title', 'video')
+            return info.get('title', 'video'), info.get('ext', 'mp4')
     finally:
         if cookie_file_path and os.path.exists(cookie_file_path):
             os.remove(cookie_file_path)
@@ -81,14 +83,13 @@ def process_video_background(job_id, youtube_url):
         JOBS[job_id]['status'] = 'מוריד מיוטיוב...'
         JOBS[job_id]['progress'] = 0
 
-        title = download_video(youtube_url, tmp_template, job_id)
+        title, ext = download_video(youtube_url, tmp_template, job_id)
+        file_name = f"{title}.{ext}"
 
         # מצא את הקובץ שנוצר
         for f in os.listdir(tmp_dir):
             if f.startswith(job_id):
                 actual_file = os.path.join(tmp_dir, f)
-                ext = f.split('.')[-1]
-                file_name = f"{title}.{ext}"
                 break
 
         if not actual_file or not os.path.exists(actual_file):
@@ -98,12 +99,12 @@ def process_video_background(job_id, youtube_url):
         JOBS[job_id]['status'] = 'מעלה לדרייב...'
         JOBS[job_id]['progress'] = 50
 
+        mimetype = 'video/mp4' if ext == 'mp4' else 'video/webm'
         file_metadata = {
             'name': file_name,
             'parents': [GOOGLE_DRIVE_FOLDER_ID] if GOOGLE_DRIVE_FOLDER_ID else []
         }
 
-        mimetype = 'video/mp4' if file_name.endswith('.mp4') else 'video/webm'
         media = MediaFileUpload(
             actual_file,
             mimetype=mimetype,
