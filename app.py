@@ -60,7 +60,7 @@ def update_download_progress(d, job_id):
         total = d.get('total_bytes') or d.get('total_bytes_estimate', 0)
         downloaded = d.get('downloaded_bytes', 0)
         if total > 0:
-            pct = int(downloaded / total * 50)  # 0-50% = הורדה
+            pct = int(downloaded / total * 50)
             JOBS[job_id]['progress'] = pct
             JOBS[job_id]['status'] = f'מוריד... {pct*2}%'
     elif d['status'] == 'finished':
@@ -80,11 +80,10 @@ def process_video_background(job_id, youtube_url):
 
         file_name = download_video(youtube_url, tmp_file, job_id)
 
-        # מצא את הקובץ שנוצר
         for f in os.listdir(tmp_dir):
             if f.startswith(job_id):
                 actual_file = os.path.join(tmp_dir, f)
-                file_name = f.replace(job_id + '.', '') 
+                file_name = f.replace(job_id + '.', '')
                 break
 
         if not actual_file or not os.path.exists(actual_file):
@@ -120,7 +119,7 @@ def process_video_background(job_id, youtube_url):
             try:
                 status, response_upload = request_upload.next_chunk()
                 if status:
-                    upload_pct = int(status.progress() * 50) + 50  # 50-100% = העלאה
+                    upload_pct = int(status.progress() * 50) + 50
                     JOBS[job_id]['progress'] = upload_pct
                     JOBS[job_id]['status'] = f'מעלה לדרייב... {upload_pct}%'
                     retries = 0
@@ -140,7 +139,6 @@ def process_video_background(job_id, youtube_url):
         JOBS[job_id]['error'] = str(e)
 
     finally:
-        # נקה קבצים זמניים
         if actual_file and os.path.exists(actual_file):
             os.remove(actual_file)
         if os.path.exists(tmp_dir):
@@ -151,7 +149,10 @@ def process_video_background(job_id, youtube_url):
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({"status": "השרת פועל וממתין"}), 200
+    return jsonify({
+        "status": "השרת פועל וממתין",
+        "yt_dlp_version": yt_dlp.version.__version__
+    }), 200
 
 @app.route('/download', methods=['POST'])
 def start_download():
