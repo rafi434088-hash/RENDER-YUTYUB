@@ -50,7 +50,6 @@ def update_download_progress(d, job_id):
 def download_video(youtube_url, output_path, job_id):
     cookie_file_path = write_cookie_file()
 
-    # פורמטים שלא דורשים ffmpeg - progressive MP4/WebM בלבד
     ydl_opts = {
         'format': 'best[ext=mp4]/best[ext=webm]/best',
         'outtmpl': output_path,
@@ -86,7 +85,6 @@ def process_video_background(job_id, youtube_url):
         title, ext = download_video(youtube_url, tmp_template, job_id)
         file_name = f"{title}.{ext}"
 
-        # מצא את הקובץ שנוצר
         for f in os.listdir(tmp_dir):
             if f.startswith(job_id):
                 actual_file = os.path.join(tmp_dir, f)
@@ -161,6 +159,40 @@ def health():
         "yt_dlp_version": yt_dlp.version.__version__,
         "cookies_loaded": bool(YOUTUBE_COOKIES)
     }), 200
+
+@app.route('/formats', methods=['POST'])
+def list_formats():
+    data = request.get_json()
+    if not data or 'url' not in data:
+        return jsonify({"error": "חסר url"}), 400
+
+    cookie_file_path = write_cookie_file()
+    ydl_opts = {
+        'quiet': True,
+        'nocheckcertificate': True,
+    }
+    if cookie_file_path:
+        ydl_opts['cookiefile'] = cookie_file_path
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(data['url'], download=False)
+            formats = [
+                {
+                    'format_id': f.get('format_id'),
+                    'ext': f.get('ext'),
+                    'resolution': f.get('resolution'),
+                    'vcodec': f.get('vcodec'),
+                    'acodec': f.get('acodec'),
+                }
+                for f in info.get('formats', [])
+            ]
+            return jsonify({"formats": formats})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        if cookie_file_path and os.path.exists(cookie_file_path):
+            os.remove(cookie_file_path)
 
 @app.route('/download', methods=['POST'])
 def start_download():
