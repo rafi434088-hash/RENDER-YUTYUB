@@ -1,6 +1,5 @@
 import os
 import json
-import requests
 import threading
 import uuid
 import time
@@ -28,32 +27,13 @@ def get_drive_service():
     )
     return build("drive", "v3", credentials=creds)
 
-def download_video(youtube_url, output_path, job_id):
-    cookie_file_path = None
-    ydl_opts = {
-        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best',
-        'merge_output_format': 'mp4',
-        'outtmpl': output_path,
-        'quiet': True,
-        'no_warnings': True,
-        'nocheckcertificate': True,
-        'progress_hooks': [lambda d: update_download_progress(d, job_id)],
-    }
-
-    if YOUTUBE_COOKIES:
-        cookie_file_path = "/tmp/youtube_cookies.txt"
-        with open(cookie_file_path, "w", encoding="utf-8") as f:
-            f.write(YOUTUBE_COOKIES)
-        ydl_opts['cookiefile'] = cookie_file_path
-
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(youtube_url, download=True)
-            title = info.get('title', 'video')
-            return title + '.mp4'
-    finally:
-        if cookie_file_path and os.path.exists(cookie_file_path):
-            os.remove(cookie_file_path)
+def write_cookie_file():
+    if not YOUTUBE_COOKIES:
+        return None
+    cookie_file_path = "/tmp/youtube_cookies.txt"
+    with open(cookie_file_path, "w", encoding="utf-8") as f:
+        f.write(YOUTUBE_COOKIES)
+    return cookie_file_path
 
 def update_download_progress(d, job_id):
     if d['status'] == 'downloading':
@@ -62,14 +42,37 @@ def update_download_progress(d, job_id):
         if total > 0:
             pct = int(downloaded / total * 50)
             JOBS[job_id]['progress'] = pct
-            JOBS[job_id]['status'] = f'מוריד... {pct*2}%'
+            JOBS[job_id]['status'] = f'מוריד... {pct * 2}%'
     elif d['status'] == 'finished':
         JOBS[job_id]['status'] = 'מעלה לדרייב...'
         JOBS[job_id]['progress'] = 50
 
+def download_video(youtube_url, output_path, job_id):
+    cookie_file_path = write_cookie_file()
+
+    ydl_opts = {
+        'format': 'best',
+        'outtmpl': output_path,
+        'quiet': True,
+        'no_warnings': True,
+        'nocheckcertificate': True,
+        'progress_hooks': [lambda d: update_download_progress(d, job_id)],
+    }
+
+    if cookie_file_path:
+        ydl_opts['cookiefile'] = cookie_file_path
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(youtube_url, download=True)
+            return info.get('title', 'video')
+    finally:
+        if cookie_file_path and os.path.exists(cookie_file_path):
+            os.remove(cookie_file_path)
+
 def process_video_background(job_id, youtube_url):
     tmp_dir = tempfile.mkdtemp()
-    tmp_file = os.path.join(tmp_dir, f"{job_id}.%(ext)s")
+    tmp_template = os.path.join(tmp_dir, f"{job_id}.%(ext)s")
     actual_file = None
 
     try:
@@ -78,12 +81,14 @@ def process_video_background(job_id, youtube_url):
         JOBS[job_id]['status'] = 'מוריד מיוטיוב...'
         JOBS[job_id]['progress'] = 0
 
-        file_name = download_video(youtube_url, tmp_file, job_id)
+        title = download_video(youtube_url, tmp_template, job_id)
 
+        # מצא את הקובץ שנוצר
         for f in os.listdir(tmp_dir):
             if f.startswith(job_id):
                 actual_file = os.path.join(tmp_dir, f)
-                file_name = f.replace(job_id + '.', '')
+                ext = f.split('.')[-1]
+                file_name = f"{title}.{ext}"
                 break
 
         if not actual_file or not os.path.exists(actual_file):
@@ -98,9 +103,10 @@ def process_video_background(job_id, youtube_url):
             'parents': [GOOGLE_DRIVE_FOLDER_ID] if GOOGLE_DRIVE_FOLDER_ID else []
         }
 
+        mimetype = 'video/mp4' if file_name.endswith('.mp4') else 'video/webm'
         media = MediaFileUpload(
             actual_file,
-            mimetype='video/mp4',
+            mimetype=mimetype,
             chunksize=5 * 1024 * 1024,
             resumable=True
         )
@@ -129,9 +135,10 @@ def process_video_background(job_id, youtube_url):
                     raise Exception(f"ההעלאה נכשלה לאחר {MAX_RETRIES} ניסיונות: {str(chunk_error)}")
                 time.sleep(2 ** retries)
 
+        file_id = response_upload.get('id')
         JOBS[job_id]['status'] = 'הסתיים בהצלחה ✅'
-        JOBS[job_id]['drive_file_id'] = response_upload.get('id')
-        JOBS[job_id]['drive_link'] = f"https://drive.google.com/file/d/{response_upload.get('id')}/view"
+        JOBS[job_id]['drive_file_id'] = file_id
+        JOBS[job_id]['drive_link'] = f"https://drive.google.com/file/d/{file_id}/view"
         JOBS[job_id]['progress'] = 100
 
     except Exception as e:
@@ -141,17 +148,17 @@ def process_video_background(job_id, youtube_url):
     finally:
         if actual_file and os.path.exists(actual_file):
             os.remove(actual_file)
-        if os.path.exists(tmp_dir):
-            try:
-                os.rmdir(tmp_dir)
-            except:
-                pass
+        try:
+            os.rmdir(tmp_dir)
+        except:
+            pass
 
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({
         "status": "השרת פועל וממתין",
-        "yt_dlp_version": yt_dlp.version.__version__
+        "yt_dlp_version": yt_dlp.version.__version__,
+        "cookies_loaded": bool(YOUTUBE_COOKIES)
     }), 200
 
 @app.route('/download', methods=['POST'])
