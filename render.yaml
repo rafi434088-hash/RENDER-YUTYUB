@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: RENDER-YUTYUB
+    runtime: python
+    buildCommand: |
+      curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+      apt-get install -y nodejs
+      pip install -r requirements.txt
+      pip install -U yt-dlp
+    startCommand: gunicorn app:app
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
